@@ -348,6 +348,9 @@ class LanceDBCollection(ICollection):
         meta_data: Optional[Dict[str, Any]] = None,
         dimension: Optional[int] = None,
         metric: str = "cosine",
+        vector_index: Optional[Dict[str, Any]] = None,
+        scalar_indexes: Optional[Dict[str, str]] = None,
+        optimize_after_bulk_ingest: bool = True,
     ):
         super().__init__()
         if not LANCEDB_AVAILABLE:  # pragma: no cover - defensive
@@ -364,6 +367,13 @@ class LanceDBCollection(ICollection):
         self._field_types: Dict[str, str] = {}
         self._index_metas: Dict[str, Dict[str, Any]] = {}
         self._meta_data: Dict[str, Any] = dict(meta_data or {})
+        self._vector_index_cfg: Optional[Dict[str, Any]] = (
+            dict(vector_index) if vector_index else None
+        )
+        self._scalar_index_cfg: Dict[str, str] = dict(scalar_indexes or {})
+        self._optimize_after_bulk_ingest = optimize_after_bulk_ingest
+        self._bulk_ingest_depth = 0
+        self._maintenance_runs = 0
         self._table: Any = None
         self._load_or_create_table(create=False)
 
@@ -531,7 +541,7 @@ class LanceDBCollection(ICollection):
         vector_index = meta_data.get("VectorIndex", {}) if isinstance(meta_data, dict) else {}
         if vector_index.get("EnableSparse"):
             raise NotImplementedError(
-                "The LanceDB backend is dense-only in this phase; sparse/hybrid index "
+                "The LanceDB backend is dense-only; sparse/hybrid index "
                 "configuration is not supported and must not be silently ignored. "
                 "Set storage.vectordb.sparse_weight to 0."
             )
@@ -542,23 +552,174 @@ class LanceDBCollection(ICollection):
             )
         self._index_metas[index_name] = dict(meta_data)
         self._persist_metadata()
+        self._apply_native_indexes(index_name)
         return self.get_index(index_name)
 
+    # -- native Lance index management ---------------------------------------
+
+    def _native_index_names(self) -> List[str]:
+        table = self._ensure_table()
+        try:
+            return [idx.name for idx in (table.list_indices() or [])]
+        except Exception as exc:
+            logger.debug("LanceDB list_indices failed: %s", exc)
+            return []
+
+    def _native_index_stats(self, name: str) -> Dict[str, Any]:
+        table = self._ensure_table()
+        try:
+            stats = table.index_stats(name)
+        except Exception as exc:
+            logger.debug("LanceDB index_stats(%r) failed: %s", name, exc)
+            return {}
+        if stats is None:
+            return {}
+        payload: Dict[str, Any] = {"state": "built"}
+        for attr in ("num_indexed_rows", "num_unindexed_rows", "index_type", "distance_type"):
+            value = getattr(stats, attr, None)
+            if value is not None:
+                payload[attr] = value
+        size = getattr(stats, "size_bytes", None)
+        if size is not None:
+            payload["size_bytes"] = int(size)
+        return payload
+
+    def _scalar_index_factory(self, index_type: str) -> Any:
+        from lancedb.index import Bitmap, BTree, LabelList
+
+        factories = {"BTREE": BTree, "BITMAP": Bitmap, "LABEL_LIST": LabelList}
+        factory = factories.get(index_type.upper())
+        if factory is None:
+            raise ValueError(
+                f"Unsupported LanceDB scalar index type {index_type!r}; "
+                f"supported: {sorted(factories)}"
+            )
+        return factory()
+
+    def _apply_native_indexes(self, index_name: str) -> None:
+        """Create configured native indexes for the current table state.
+
+        Vector (ANN) training is deferred until the table reaches the
+        configured row count; deferred indexes are reported as ``pending``
+        and built by bulk-ingest completion or an explicit optimize call.
+        Search remains correct in the meantime because unindexed fragments
+        are scanned flat.
+        """
+        table = self._ensure_table()
+
+        for field, index_type in self._scalar_index_cfg.items():
+            if field not in self._field_types:
+                logger.warning("LanceDB scalar index on unknown field %r is skipped", field)
+                continue
+            config = self._scalar_index_factory(index_type)
+            table.create_index(field, config=config)
+            logger.info("LanceDB scalar index created on %s (%s)", field, index_type)
+
+        if self._vector_index_cfg:
+            self._maybe_build_vector_index(index_name, force=False)
+
+    def _maybe_build_vector_index(self, index_name: str, *, force: bool) -> bool:
+        from lancedb.index import (
+            IvfFlat,
+            IvfHnswFlat,
+            IvfHnswPq,
+            IvfHnswSq,
+            IvfPq,
+            IvfSq,
+        )
+
+        table = self._ensure_table()
+        native_names = set(self._native_index_names())
+        if index_name in native_names and not force:
+            return False
+
+        cfg = self._vector_index_cfg or {}
+        min_rows = int(cfg.get("min_rows_to_build", 256))
+        row_count = table.count_rows()
+        if not force and row_count < min_rows:
+            logger.info(
+                "LanceDB vector index %r deferred: %d rows < %d required to train; "
+                "flat scan keeps search correct meanwhile",
+                index_name,
+                row_count,
+                min_rows,
+            )
+            return False
+
+        factories = {
+            "IVF_PQ": IvfPq,
+            "IVF_FLAT": IvfFlat,
+            "IVF_SQ": IvfSq,
+            "IVF_HNSW_PQ": IvfHnswPq,
+            "IVF_HNSW_SQ": IvfHnswSq,
+            "IVF_HNSW_FLAT": IvfHnswFlat,
+        }
+        index_type = str(cfg.get("index_type", "IVF_PQ")).upper()
+        factory = factories.get(index_type)
+        if factory is None:
+            raise ValueError(
+                f"Unsupported LanceDB vector index type {index_type!r}; "
+                f"supported: {sorted(factories)}"
+            )
+        kwargs: Dict[str, Any] = {"distance_type": self._metric}
+        for key in ("num_partitions", "num_sub_vectors"):
+            if cfg.get(key) is not None:
+                kwargs[key] = cfg[key]
+        if index_type.endswith("PQ") and cfg.get("num_bits") is not None:
+            kwargs["num_bits"] = cfg["num_bits"]
+        table.create_index(
+            VECTOR_FIELD_NAME, config=factory(**kwargs), name=index_name, replace=True
+        )
+        logger.info(
+            "LanceDB vector index %r built (%s, %d rows)",
+            index_name,
+            index_type,
+            row_count,
+        )
+        return True
+
+    def optimize_index(self, index_name: Optional[str] = None) -> Dict[str, Any]:
+        """Explicitly rebuild/refresh native indexes and compact fragments."""
+        table = self._ensure_table()
+        target = index_name or next(iter(self._index_metas), None)
+        report: Dict[str, Any] = {}
+        if target and self._vector_index_cfg:
+            report["vector_index_built"] = self._maybe_build_vector_index(target, force=True)
+        table.optimize()
+        report["maintenance_runs"] = self._maintenance_runs + 1
+        self._maintenance_runs += 1
+        return report
+
     def has_index(self, index_name: str) -> bool:
-        return index_name in self._index_metas
+        return index_name in self._index_metas or index_name in set(self._native_index_names())
 
     def get_index(self, index_name: str) -> Optional[Any]:
-        if index_name not in self._index_metas:
+        if not self.has_index(index_name):
             return None
-        return self._index_metas[index_name]
+        return self._index_metas.get(index_name, {"IndexName": index_name})
 
     def get_index_meta_data(self, index_name: str) -> Dict[str, Any]:
-        return dict(self._index_metas.get(index_name, {}))
+        meta = dict(self._index_metas.get(index_name, {}))
+        native_names = set(self._native_index_names())
+        if index_name in native_names:
+            meta.update(self._native_index_stats(index_name))
+            meta.setdefault("state", "built")
+        elif meta:
+            meta["state"] = "pending"
+        for field in self._scalar_index_cfg:
+            if f"{field}_idx" in native_names:
+                meta.setdefault("ScalarIndex", []).append(field)
+        return meta
 
     def list_indexes(self) -> List[str]:
-        return list(self._index_metas.keys())
+        names = set(self._index_metas.keys())
+        names.update(self._native_index_names())
+        return sorted(names)
 
     def drop_index(self, index_name: str):
+        table = self._ensure_table()
+        if index_name in self._native_index_names():
+            table.drop_index(index_name)
         self._index_metas.pop(index_name, None)
         self._persist_metadata()
 
@@ -574,6 +735,41 @@ class LanceDBCollection(ICollection):
         if description is not None:
             meta["Description"] = description
         self._persist_metadata()
+
+    # -- bulk ingest maintenance ----------------------------------------------
+
+    def begin_bulk_ingest(self) -> None:
+        """Suspend index maintenance until the matching end_bulk_ingest."""
+        self._bulk_ingest_depth += 1
+
+    def end_bulk_ingest(self) -> None:
+        """Resume index maintenance, coalescing the whole scope into one pass.
+
+        N batches inside one scope must not trigger N maintenance actions:
+        compaction and index optimization run exactly once at scope exit.
+        """
+        if self._bulk_ingest_depth > 0:
+            self._bulk_ingest_depth -= 1
+        if self._bulk_ingest_depth > 0:
+            return
+        if not self._optimize_after_bulk_ingest or self._table is None:
+            return
+        self._run_coalesced_maintenance()
+
+    def _run_coalesced_maintenance(self) -> None:
+        table = self._ensure_table()
+        if self._vector_index_cfg:
+            target = next(iter(self._index_metas), None)
+            if target:
+                self._maybe_build_vector_index(target, force=False)
+        table.optimize()
+        self._maintenance_runs += 1
+        logger.info("LanceDB coalesced bulk-ingest maintenance completed")
+
+    @property
+    def maintenance_runs(self) -> int:
+        """Number of coalesced maintenance passes executed (observability)."""
+        return self._maintenance_runs
 
     # -- data write path -----------------------------------------------------
 
@@ -621,6 +817,20 @@ class LanceDBCollection(ICollection):
         table.merge_insert(
             ID_FIELD_NAME
         ).when_matched_update_all().when_not_matched_insert_all().execute(rows)
+        self._maybe_autobuild_vector_index()
+
+    def _maybe_autobuild_vector_index(self) -> None:
+        """Build a deferred ANN index once the row threshold is first reached.
+
+        Outside bulk scopes a pending index is built at most once: after the
+        native index exists this returns without rebuilding.  Inside a bulk
+        scope the coalesced maintenance pass at scope exit owns the build.
+        """
+        if self._bulk_ingest_depth > 0 or not self._vector_index_cfg:
+            return
+        target = next(iter(self._index_metas), None)
+        if target:
+            self._maybe_build_vector_index(target, force=False)
 
     @staticmethod
     def _align_row_columns(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -939,6 +1149,9 @@ def create_lancedb_collection(
     meta_data: Dict[str, Any],
     dimension: Optional[int] = None,
     metric: str = "cosine",
+    vector_index: Optional[Dict[str, Any]] = None,
+    scalar_indexes: Optional[Dict[str, str]] = None,
+    optimize_after_bulk_ingest: bool = True,
 ) -> Tuple[LanceDBCollection, bool]:
     """Open or create a LanceDB-backed collection.
 
@@ -958,6 +1171,9 @@ def create_lancedb_collection(
         meta_data=meta_data,
         dimension=dimension,
         metric=metric,
+        vector_index=vector_index,
+        scalar_indexes=scalar_indexes,
+        optimize_after_bulk_ingest=optimize_after_bulk_ingest,
     )
     if existed:
         return collection, False

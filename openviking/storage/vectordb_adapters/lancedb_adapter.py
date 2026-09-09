@@ -56,6 +56,9 @@ class LanceDBCollectionAdapter(CollectionAdapter):
         index_name: str,
         storage_options: Optional[Dict[str, str]] = None,
         read_consistency_interval_ms: Optional[float] = None,
+        vector_index: Optional[Dict[str, Any]] = None,
+        scalar_indexes: Optional[Dict[str, str]] = None,
+        optimize_after_bulk_ingest: bool = True,
     ):
         super().__init__(collection_name=table_name, index_name=index_name)
         if not LANCEDB_AVAILABLE:
@@ -66,6 +69,9 @@ class LanceDBCollectionAdapter(CollectionAdapter):
         self._uri = uri
         self._storage_options = dict(storage_options or {})
         self._read_consistency_interval_ms = read_consistency_interval_ms
+        self._vector_index = vector_index
+        self._scalar_indexes = dict(scalar_indexes or {})
+        self._optimize_after_bulk_ingest = optimize_after_bulk_ingest
         self._db: Any = None
         self._collection: Optional[Collection] = None
 
@@ -86,12 +92,16 @@ class LanceDBCollectionAdapter(CollectionAdapter):
                 "Sparse/hybrid retrieval is rejected instead of silently ignored."
             )
         storage_options = _expand_env_placeholders(getattr(cfg, "storage_options", {}) or {})
+        vector_index_cfg = getattr(cfg, "vector_index", None)
         return cls(
             uri=cfg.uri,
             table_name=config.name or "context",
             index_name=config.index_name or "default",
             storage_options=storage_options,
             read_consistency_interval_ms=getattr(cfg, "read_consistency_interval_ms", None),
+            vector_index=vector_index_cfg.model_dump() if vector_index_cfg else None,
+            scalar_indexes=getattr(cfg, "scalar_indexes", {}) or {},
+            optimize_after_bulk_ingest=bool(getattr(cfg, "optimize_after_bulk_ingest", True)),
         )
 
     # -- backend connection ---------------------------------------------------
@@ -133,6 +143,9 @@ class LanceDBCollectionAdapter(CollectionAdapter):
             meta_data={},
             dimension=config.embedding.dimension,
             metric=vectordb_metric(config),
+            vector_index=self._vector_index,
+            scalar_indexes=self._scalar_indexes,
+            optimize_after_bulk_ingest=self._optimize_after_bulk_ingest,
         )
         return Collection(collection)
 
@@ -154,6 +167,9 @@ class LanceDBCollectionAdapter(CollectionAdapter):
             meta_data=meta,
             dimension=config.embedding.dimension,
             metric=vectordb_metric(config),
+            vector_index=self._vector_index,
+            scalar_indexes=self._scalar_indexes,
+            optimize_after_bulk_ingest=self._optimize_after_bulk_ingest,
         )
         if not created:
             logger = self._get_logger()
@@ -162,6 +178,14 @@ class LanceDBCollectionAdapter(CollectionAdapter):
                 self._collection_name,
             )
         return Collection(collection)
+
+    def begin_bulk_ingest(self) -> None:
+        if self._collection is not None:
+            self._collection.begin_bulk_ingest()
+
+    def end_bulk_ingest(self) -> None:
+        if self._collection is not None:
+            self._collection.end_bulk_ingest()
 
     @staticmethod
     def _get_logger():

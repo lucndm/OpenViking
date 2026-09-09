@@ -188,6 +188,44 @@ class CuVSConfig(BaseModel):
         return self
 
 
+class LanceVectorIndexConfig(BaseModel):
+    """Native Lance vector (ANN) index configuration."""
+
+    index_type: Literal[
+        "IVF_PQ",
+        "IVF_FLAT",
+        "IVF_SQ",
+        "IVF_HNSW_PQ",
+        "IVF_HNSW_SQ",
+        "IVF_HNSW_FLAT",
+    ] = Field(
+        default="IVF_PQ",
+        description="Lance ANN index type; IVF_PQ is the production default.",
+    )
+    num_partitions: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description="IVF partition count; None lets Lance derive it from table size.",
+    )
+    num_sub_vectors: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description="PQ sub-vector count; None lets Lance derive it from dimension.",
+    )
+    num_bits: int = Field(default=8, ge=1, le=16, description="PQ quantization bits.")
+    min_rows_to_build: int = Field(
+        default=256,
+        ge=0,
+        description=(
+            "Defer ANN training until the table has at least this many rows. "
+            "Search remains correct meanwhile: unindexed fragments are scanned "
+            "flat."
+        ),
+    )
+
+    model_config = {"extra": "forbid"}
+
+
 class LanceDBConfig(BaseModel):
     """Configuration for the LanceDB backend.
 
@@ -219,8 +257,41 @@ class LanceDBConfig(BaseModel):
             "Interval for automatic table refresh, in milliseconds. None keeps the LanceDB default."
         ),
     )
+    vector_index: Optional[LanceVectorIndexConfig] = Field(
+        default=None,
+        description=(
+            "Native Lance ANN vector index; None keeps flat (unindexed) dense "
+            "search, which stays correct at any table size."
+        ),
+    )
+    scalar_indexes: Dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Native Lance scalar indexes per field, e.g. "
+            "{'account_id': 'BTREE', 'search_tags': 'LABEL_LIST'}. "
+            "Supported types: BTREE, BITMAP, LABEL_LIST."
+        ),
+    )
+    optimize_after_bulk_ingest: bool = Field(
+        default=True,
+        description=(
+            "Run one coalesced maintenance pass (compaction + index "
+            "optimization) when a bulk-ingest scope ends, instead of per batch."
+        ),
+    )
 
     model_config = {"extra": "forbid"}
+
+    @model_validator(mode="after")
+    def validate_scalar_indexes(self):
+        allowed = {"BTREE", "BITMAP", "LABEL_LIST"}
+        for field, index_type in self.scalar_indexes.items():
+            if index_type not in allowed:
+                raise ValueError(
+                    f"LanceDB scalar index type {index_type!r} for field {field!r} "
+                    f"must be one of {sorted(allowed)}"
+                )
+        return self
 
 
 class VectorDBBackendConfig(BaseModel):
