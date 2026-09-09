@@ -188,6 +188,41 @@ class CuVSConfig(BaseModel):
         return self
 
 
+class LanceDBConfig(BaseModel):
+    """Configuration for the LanceDB backend.
+
+    ``uri`` addresses the LanceDB database: a local directory path (for
+    development) or an object-store prefix such as ``s3://bucket/parent``
+    (durable deployments, e.g. SeaweedFS S3).  Storage credentials are passed
+    via ``storage_options``; values of the form ``${ENV_VAR}`` are expanded
+    from the environment so permanent keys never live in config files.
+    """
+
+    uri: Optional[str] = Field(
+        default=None,
+        description=(
+            "LanceDB database URI: local path or object-store prefix "
+            "(e.g. 's3://openviking/lancedb')"
+        ),
+    )
+    storage_options: Dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Storage options passed to LanceDB (e.g. aws_endpoint, aws_region, "
+            "allow_http). '${ENV_VAR}' values are expanded from the environment."
+        ),
+    )
+    read_consistency_interval_ms: Optional[float] = Field(
+        default=None,
+        ge=0,
+        description=(
+            "Interval for automatic table refresh, in milliseconds. None keeps the LanceDB default."
+        ),
+    )
+
+    model_config = {"extra": "forbid"}
+
+
 class VectorDBBackendConfig(BaseModel):
     """
     Configuration for VectorDB backend.
@@ -201,7 +236,8 @@ class VectorDBBackendConfig(BaseModel):
         description=(
             "VectorDB backend type: 'local', 'cuvs', 'http', "
             "'volcengine' (AK/SK signed or API key data-plane only), "
-            "or 'vikingdb' (private deployment)"
+            "'vikingdb' (private deployment), or 'lancedb' (Lance format, "
+            "local or object storage)"
         ),
     )
 
@@ -260,6 +296,11 @@ class VectorDBBackendConfig(BaseModel):
         description="NVIDIA cuVS dense-vector search configuration for the 'cuvs' backend",
     )
 
+    lancedb: Optional[LanceDBConfig] = Field(
+        default_factory=LanceDBConfig,
+        description="LanceDB configuration for the 'lancedb' backend",
+    )
+
     custom_params: Dict[str, Any] = Field(
         default_factory=dict,
         description="Custom parameters for custom backend adapters",
@@ -276,6 +317,7 @@ class VectorDBBackendConfig(BaseModel):
             "http",
             "volcengine",
             "vikingdb",
+            "lancedb",
         ]
 
         # Allow custom backend classes (containing dot) without standard validation
@@ -324,5 +366,17 @@ class VectorDBBackendConfig(BaseModel):
         elif self.backend == "vikingdb":
             if not self.vikingdb or not self.vikingdb.host:
                 raise ValueError("VectorDB vikingdb backend requires 'host' to be set")
+
+        elif self.backend == "lancedb":
+            if not self.lancedb or not self.lancedb.uri:
+                raise ValueError("VectorDB lancedb backend requires 'lancedb.uri' to be set")
+            if self.sparse_weight > 0.0:
+                raise ValueError(
+                    "VectorDB lancedb backend is dense-only; 'sparse_weight' must be 0"
+                )
+            if self.distance_metric not in ("cosine", "l2", "ip"):
+                raise ValueError(
+                    "VectorDB lancedb backend supports distance_metric 'cosine', 'l2', or 'ip'"
+                )
 
         return self
