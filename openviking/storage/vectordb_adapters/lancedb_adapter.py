@@ -59,6 +59,9 @@ class LanceDBCollectionAdapter(CollectionAdapter):
         vector_index: Optional[Dict[str, Any]] = None,
         scalar_indexes: Optional[Dict[str, str]] = None,
         optimize_after_bulk_ingest: bool = True,
+        fts: Optional[Dict[str, Any]] = None,
+        hybrid: Optional[Dict[str, Any]] = None,
+        store_content: bool = False,
     ):
         super().__init__(collection_name=table_name, index_name=index_name)
         if not LANCEDB_AVAILABLE:
@@ -66,12 +69,19 @@ class LanceDBCollectionAdapter(CollectionAdapter):
                 "The 'lancedb' package is required for the LanceDB backend. "
                 "Install it with: pip install lancedb"
             )
+        # ``content`` is persisted only when explicitly opted in; this drives
+        # the upstream write path (see CollectionAdapter.USE_CONTENT_FIELD)
+        # and the grep engine capability check.
+        self.USE_CONTENT_FIELD = store_content
         self._uri = uri
         self._storage_options = dict(storage_options or {})
         self._read_consistency_interval_ms = read_consistency_interval_ms
         self._vector_index = vector_index
         self._scalar_indexes = dict(scalar_indexes or {})
         self._optimize_after_bulk_ingest = optimize_after_bulk_ingest
+        self._fts = fts
+        self._hybrid = hybrid
+        self._store_content = store_content
         self._db: Any = None
         self._collection: Optional[Collection] = None
 
@@ -93,6 +103,8 @@ class LanceDBCollectionAdapter(CollectionAdapter):
             )
         storage_options = _expand_env_placeholders(getattr(cfg, "storage_options", {}) or {})
         vector_index_cfg = getattr(cfg, "vector_index", None)
+        fts_cfg = getattr(cfg, "fts", None)
+        hybrid_cfg = getattr(cfg, "hybrid", None)
         return cls(
             uri=cfg.uri,
             table_name=config.name or "context",
@@ -102,6 +114,9 @@ class LanceDBCollectionAdapter(CollectionAdapter):
             vector_index=vector_index_cfg.model_dump() if vector_index_cfg else None,
             scalar_indexes=getattr(cfg, "scalar_indexes", {}) or {},
             optimize_after_bulk_ingest=bool(getattr(cfg, "optimize_after_bulk_ingest", True)),
+            fts=fts_cfg.model_dump() if fts_cfg else None,
+            hybrid=hybrid_cfg.model_dump() if hybrid_cfg else None,
+            store_content=bool(getattr(cfg, "store_content", False)),
         )
 
     # -- backend connection ---------------------------------------------------
@@ -146,6 +161,9 @@ class LanceDBCollectionAdapter(CollectionAdapter):
             vector_index=self._vector_index,
             scalar_indexes=self._scalar_indexes,
             optimize_after_bulk_ingest=self._optimize_after_bulk_ingest,
+            fts=self._fts,
+            hybrid=self._hybrid,
+            store_content=self._store_content,
         )
         return Collection(collection)
 
@@ -170,6 +188,9 @@ class LanceDBCollectionAdapter(CollectionAdapter):
             vector_index=self._vector_index,
             scalar_indexes=self._scalar_indexes,
             optimize_after_bulk_ingest=self._optimize_after_bulk_ingest,
+            fts=self._fts,
+            hybrid=self._hybrid,
+            store_content=self._store_content,
         )
         if not created:
             logger = self._get_logger()
@@ -186,6 +207,46 @@ class LanceDBCollectionAdapter(CollectionAdapter):
     def end_bulk_ingest(self) -> None:
         if self._collection is not None:
             self._collection.end_bulk_ingest()
+
+    def search_by_keywords(
+        self,
+        keywords: Optional[list[str]] = None,
+        query: Optional[str] = None,
+        limit: int = 10,
+        offset: int = 0,
+        filter=None,
+        output_fields: Optional[list[str]] = None,
+        query_vector: Optional[list[float]] = None,
+    ) -> list[dict[str, Any]]:
+        """Keyword (BM25) search with optional dense+lexical hybrid fusion.
+
+        ``query_vector`` is a LanceDB capability extension: when provided and
+        hybrid search is configured, dense and lexical candidates are fused
+        through the configured reranker.  Both branches share the same
+        security filter.
+        """
+        coll = self.get_collection()
+        compiled_filter = self._compile_filter(filter)
+        result = coll.search_by_keywords(
+            self._index_name,
+            keywords=keywords,
+            query=query,
+            limit=limit,
+            offset=offset,
+            filters=compiled_filter,
+            output_fields=output_fields,
+            dense_vector=query_vector,
+        )
+        records: list[dict[str, Any]] = []
+        for item in result.data:
+            record = dict(item.fields) if item.fields else {}
+            record["id"] = item.id
+            raw_score = item.score if item.score is not None else 0.0
+            if raw_score != raw_score:  # NaN guard
+                raw_score = 0.0
+            record["_score"] = raw_score
+            records.append(self._normalize_record_for_read(record))
+        return records
 
     @staticmethod
     def _get_logger():

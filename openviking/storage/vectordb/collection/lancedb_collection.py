@@ -63,6 +63,9 @@ _META_DIMENSION = "ov.dim"
 _META_METRIC = "ov.metric"
 _META_FIELD_TYPES = "ov.field_types"
 _META_SCALAR_INDEX = "ov.scalar_index"
+_META_FTS = "ov.fts"
+_META_HYBRID = "ov.hybrid"
+_META_STORE_CONTENT = "ov.store_content"
 
 _PATH_DEPTH_RE = re.compile(r"^\s*-d=(-?\d+)\s*$")
 
@@ -351,6 +354,9 @@ class LanceDBCollection(ICollection):
         vector_index: Optional[Dict[str, Any]] = None,
         scalar_indexes: Optional[Dict[str, str]] = None,
         optimize_after_bulk_ingest: bool = True,
+        fts: Optional[Dict[str, Any]] = None,
+        hybrid: Optional[Dict[str, Any]] = None,
+        store_content: bool = False,
     ):
         super().__init__()
         if not LANCEDB_AVAILABLE:  # pragma: no cover - defensive
@@ -372,6 +378,9 @@ class LanceDBCollection(ICollection):
         )
         self._scalar_index_cfg: Dict[str, str] = dict(scalar_indexes or {})
         self._optimize_after_bulk_ingest = optimize_after_bulk_ingest
+        self._fts_cfg: Optional[Dict[str, Any]] = dict(fts) if fts else None
+        self._hybrid_cfg: Optional[Dict[str, Any]] = dict(hybrid) if hybrid else None
+        self._store_content = store_content
         self._bulk_ingest_depth = 0
         self._maintenance_runs = 0
         self._table: Any = None
@@ -424,6 +433,18 @@ class LanceDBCollection(ICollection):
             if stored_metric in LANCEDB_METRICS:
                 self._metric = LANCEDB_METRICS[stored_metric]
                 self._ov_metric = stored_metric
+        if _META_FTS in stored and self._fts_cfg is None:
+            try:
+                self._fts_cfg = json.loads(stored[_META_FTS])
+            except json.JSONDecodeError:
+                logger.warning("LanceDB FTS metadata is corrupt; ignoring it")
+        if _META_HYBRID in stored and self._hybrid_cfg is None:
+            try:
+                self._hybrid_cfg = json.loads(stored[_META_HYBRID])
+            except json.JSONDecodeError:
+                logger.warning("LanceDB hybrid metadata is corrupt; ignoring it")
+        if _META_STORE_CONTENT in stored:
+            self._store_content = stored[_META_STORE_CONTENT] == "true"
 
     def _infer_field_types_from_arrow(self) -> Dict[str, str]:
         import pyarrow as pa
@@ -463,6 +484,12 @@ class LanceDBCollection(ICollection):
         scalar_index = self._meta_data.get("ScalarIndex")
         if scalar_index:
             payload[_META_SCALAR_INDEX] = json.dumps(list(scalar_index))
+        if self._fts_cfg:
+            payload[_META_FTS] = json.dumps(self._fts_cfg)
+        if self._hybrid_cfg:
+            payload[_META_HYBRID] = json.dumps(self._hybrid_cfg)
+        if self._store_content:
+            payload[_META_STORE_CONTENT] = "true"
         try:
             self._table.replace_field_metadata(_META_COLUMN, payload)
         except Exception as exc:  # pragma: no cover - backend dependent
@@ -521,6 +548,13 @@ class LanceDBCollection(ICollection):
         )
         if scalar_index:
             meta["ScalarIndex"] = scalar_index
+        if self._fts_cfg:
+            # Report the same FullText shape the grep engine resolver uses
+            # to decide whether server-side full-text grep is available.
+            meta["FullText"] = [
+                {"Field": column, "Analyzer": {"Tokenizer": "standard"}}
+                for column in self._fts_cfg.get("columns", ["content"])
+            ]
         return meta
 
     def update(self, fields: Optional[Dict[str, Any]] = None, description: Optional[str] = None):
@@ -615,8 +649,41 @@ class LanceDBCollection(ICollection):
             table.create_index(field, config=config)
             logger.info("LanceDB scalar index created on %s (%s)", field, index_type)
 
+        if self._fts_cfg:
+            self._ensure_fts_index()
+
         if self._vector_index_cfg:
             self._maybe_build_vector_index(index_name, force=False)
+
+    def _ensure_fts_index(self) -> None:
+        """Create FTS indexes once; later writes stay visible via flat scans."""
+        table = self._ensure_table()
+        cfg = self._fts_cfg or {}
+        columns = list(cfg.get("columns") or ["content"])
+        for column in columns:
+            if column not in self._field_types:
+                raise ValueError(
+                    f"LanceDB FTS column {column!r} is not part of the collection schema"
+                )
+        existing_fts = {
+            idx.name
+            for idx in (table.list_indices() or [])
+            if str(getattr(idx, "index_type", "")).upper() == "FTS"
+        }
+        if existing_fts:
+            return
+        for column in columns:
+            table.create_fts_index(
+                column,
+                language=cfg.get("language", "English"),
+                with_position=bool(cfg.get("with_position", False)),
+                stem=bool(cfg.get("stem", True)),
+                remove_stop_words=bool(cfg.get("remove_stop_words", True)),
+                ascii_folding=bool(cfg.get("ascii_folding", True)),
+                custom_stop_words=cfg.get("custom_stop_words"),
+                replace=False,
+            )
+        logger.info("LanceDB FTS index created on %s", columns)
 
     def _maybe_build_vector_index(self, index_name: str, *, force: bool) -> bool:
         from lancedb.index import (
@@ -1007,11 +1074,85 @@ class LanceDBCollection(ICollection):
         offset: int = 0,
         filters: Optional[Dict[str, Any]] = None,
         output_fields: Optional[List[str]] = None,
+        dense_vector: Optional[List[float]] = None,
     ) -> SearchResult:
-        raise NotImplementedError(
-            "LanceDB keyword/full-text search is not enabled for this backend; "
-            "grep falls back to the filesystem engine"
-        )
+        """Full-text (BM25) search with optional dense+lexical hybrid fusion.
+
+        Both branches (FTS and vector) are constrained by the same SQL
+        predicate before fusion, so account/ACL/path filters cannot be
+        bypassed by either candidate source.
+        """
+        if not self._fts_cfg:
+            raise NotImplementedError(
+                "LanceDB keyword/full-text search is disabled; enable "
+                "'lancedb.fts' (requires 'store_content: true') or rely on the "
+                "filesystem grep fallback"
+            )
+        table = self._ensure_table()
+        query_text = (
+            query or " ".join(kw.strip() for kw in (keywords or []) if kw.strip())
+        ).strip()
+        if not query_text:
+            return SearchResult()
+        columns = list(self._fts_cfg.get("columns") or ["content"])
+        where = self._filter_sql(filters)
+
+        use_hybrid = dense_vector is not None and self._hybrid_cfg is not None
+        if use_hybrid and dense_vector is not None:
+            builder = (
+                table.search(query_type="hybrid", vector_column_name=VECTOR_FIELD_NAME)
+                .vector(self._validate_query_vector(dense_vector))
+                .text(query_text)
+                .where(where, prefilter=True)
+                .rerank(self._hybrid_reranker())
+                .limit(limit)
+            )
+        else:
+            if dense_vector is not None:
+                raise NotImplementedError(
+                    "LanceDB hybrid search is disabled; enable 'lancedb.hybrid' "
+                    "to fuse dense and lexical branches"
+                )
+            builder = (
+                table.search(query_text, query_type="fts", fts_columns=columns)
+                .where(where, prefilter=True)
+                .limit(limit)
+            )
+        if offset:
+            builder = builder.offset(offset)
+        if output_fields is not None:
+            projection = [ID_FIELD_NAME, *output_fields]
+            builder = builder.select(list(dict.fromkeys(projection)))
+        rows = builder.to_list()
+
+        def _score(row: Dict[str, Any]) -> float:
+            for key in ("_relevance_score", "_score"):
+                value = row.get(key)
+                if isinstance(value, (int, float)) and value == value:
+                    return float(value)
+            return 0.0
+
+        return self._rows_to_search_result(rows, output_fields, _score)
+
+    def _hybrid_reranker(self) -> Any:
+        from lancedb.rerankers import RRFReranker
+
+        cfg = self._hybrid_cfg or {}
+        method = str(cfg.get("method", "rrf")).lower()
+        if method == "rrf":
+            return RRFReranker(K=int(cfg.get("rrf_k", 60)), return_score="relevance")
+        if method == "weighted":
+            from lancedb.rerankers import LinearCombinationReranker
+
+            dense_weight = float(cfg.get("dense_weight", 0.7))
+            lexical_weight = float(cfg.get("lexical_weight", 0.3))
+            total = dense_weight + lexical_weight
+            if total <= 0:
+                raise ValueError("LanceDB hybrid weights must sum to a positive value")
+            # LinearCombinationReranker weights the vector score; the lexical
+            # weight is its complement after normalization.
+            return LinearCombinationReranker(weight=dense_weight / total, return_score="relevance")
+        raise ValueError(f"Unsupported LanceDB hybrid method {method!r}")
 
     def search_by_id(
         self,
@@ -1152,6 +1293,9 @@ def create_lancedb_collection(
     vector_index: Optional[Dict[str, Any]] = None,
     scalar_indexes: Optional[Dict[str, str]] = None,
     optimize_after_bulk_ingest: bool = True,
+    fts: Optional[Dict[str, Any]] = None,
+    hybrid: Optional[Dict[str, Any]] = None,
+    store_content: bool = False,
 ) -> Tuple[LanceDBCollection, bool]:
     """Open or create a LanceDB-backed collection.
 
@@ -1174,6 +1318,9 @@ def create_lancedb_collection(
         vector_index=vector_index,
         scalar_indexes=scalar_indexes,
         optimize_after_bulk_ingest=optimize_after_bulk_ingest,
+        fts=fts,
+        hybrid=hybrid,
+        store_content=store_content,
     )
     if existed:
         return collection, False

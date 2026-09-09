@@ -226,6 +226,56 @@ class LanceVectorIndexConfig(BaseModel):
     model_config = {"extra": "forbid"}
 
 
+class LanceFTSConfig(BaseModel):
+    """Full-text search configuration for the LanceDB backend."""
+
+    columns: list[str] = Field(
+        default_factory=lambda: ["content"],
+        description="Columns to index for full-text search.",
+    )
+    language: str = Field(
+        default="English",
+        description="Stemming language for the tokenizer (e.g. 'English', 'Chinese').",
+    )
+    with_position: bool = Field(
+        default=False,
+        description="Store token positions; required for phrase queries.",
+    )
+    stem: bool = Field(default=True, description="Enable stemming.")
+    remove_stop_words: bool = Field(default=True, description="Drop stop words.")
+    ascii_folding: bool = Field(
+        default=True,
+        description="Fold accented characters to ASCII so diacritic-insensitive matches work.",
+    )
+    custom_stop_words: Optional[list[str]] = Field(
+        default=None, description="Extra stop words beyond the language defaults."
+    )
+
+    model_config = {"extra": "forbid"}
+
+
+class LanceHybridConfig(BaseModel):
+    """Dense + lexical fusion configuration for the LanceDB backend.
+
+    These are neutral controls: the generic ``sparse_weight`` setting is not
+    reused for LanceDB lexical weighting.
+    """
+
+    method: Literal["rrf", "weighted"] = Field(
+        default="rrf",
+        description="Fusion method: reciprocal rank fusion or weighted scores.",
+    )
+    dense_weight: float = Field(
+        default=0.7, ge=0.0, le=1.0, description="Weight of the dense branch."
+    )
+    lexical_weight: float = Field(
+        default=0.3, ge=0.0, le=1.0, description="Weight of the lexical branch."
+    )
+    rrf_k: int = Field(default=60, ge=1, description="RRF smoothing constant.")
+
+    model_config = {"extra": "forbid"}
+
+
 class LanceDBConfig(BaseModel):
     """Configuration for the LanceDB backend.
 
@@ -279,6 +329,24 @@ class LanceDBConfig(BaseModel):
             "optimization) when a bulk-ingest scope ends, instead of per batch."
         ),
     )
+    store_content: bool = Field(
+        default=False,
+        description=(
+            "Persist the full 'content' field so LanceDB full-text search and "
+            "grep integration can be enabled. AGFS remains the canonical "
+            "content source."
+        ),
+    )
+    fts: Optional[LanceFTSConfig] = Field(
+        default=None,
+        description="Opt-in full-text (BM25) index over persisted text columns.",
+    )
+    hybrid: Optional[LanceHybridConfig] = Field(
+        default=None,
+        description=(
+            "Opt-in dense + lexical fusion used when a keyword query also carries a query vector."
+        ),
+    )
 
     model_config = {"extra": "forbid"}
 
@@ -291,6 +359,25 @@ class LanceDBConfig(BaseModel):
                     f"LanceDB scalar index type {index_type!r} for field {field!r} "
                     f"must be one of {sorted(allowed)}"
                 )
+        return self
+
+    @model_validator(mode="after")
+    def validate_search_features(self):
+        if self.fts is not None and not self.store_content:
+            if "content" in self.fts.columns:
+                raise ValueError(
+                    "LanceDB full-text search over 'content' requires "
+                    "'store_content: true'; refusing to index a field that is "
+                    "never persisted"
+                )
+        if self.hybrid is not None and self.fts is None:
+            raise ValueError(
+                "LanceDB hybrid search requires 'fts' to be configured for the lexical branch"
+            )
+        if self.hybrid is not None:
+            total = self.hybrid.dense_weight + self.hybrid.lexical_weight
+            if total <= 0:
+                raise ValueError("LanceDB hybrid weights must sum to a positive value")
         return self
 
 

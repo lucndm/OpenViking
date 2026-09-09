@@ -145,7 +145,7 @@ class _GrepMixin:
         backend_type = getattr(vector_store, "_backend_type", "unknown")
         # Keep this set consistent with ``CollectionAdapter.USE_CONTENT_FIELD``:
         # only these backends store the ``content`` field required for full-text grep.
-        if backend_type not in ("volcengine", "vikingdb"):
+        if backend_type not in ("volcengine", "vikingdb", "lancedb"):
             return "fs"
 
         # Check collection has content field and FullText config
@@ -277,7 +277,9 @@ class _GrepMixin:
         """VikingDB bm25 recall + local fs precise matching."""
         vector_store = self._get_vector_store()
         tags_by_uri: Dict[str, List[str]] = {}
-        output_fields = ["uri", "search_tags"] if tag_filter is not None or include_tags else ["uri"]
+        output_fields = (
+            ["uri", "search_tags"] if tag_filter is not None or include_tags else ["uri"]
+        )
 
         # Split regex alternation (e.g. "error|warning|fail") and join as a
         # single query string for bm25 search. VikingDB's standard tokenizer

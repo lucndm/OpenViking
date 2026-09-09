@@ -374,6 +374,7 @@ class Collection:
         offset: int = 0,
         filters: Optional[Dict[str, Any]] = None,
         output_fields: Optional[List[str]] = None,
+        **kwargs: Any,
     ):
         """Search by keywords or query string using vectorization.
 
@@ -386,6 +387,8 @@ class Collection:
             filters (Optional[Dict[str, Any]]): Query filters to narrow down results. Defaults to None.
             output_fields (Optional[List[str]]): List of field names to include in results.
                 If None, returns all fields. Defaults to None.
+            **kwargs (Any): Backend-specific extensions forwarded to the
+                underlying collection (e.g. LanceDB hybrid ``dense_vector``).
 
         Returns:
             SearchResult: Search results containing matching documents with scores and field values.
@@ -397,7 +400,7 @@ class Collection:
         if self.__collection is None:
             raise RuntimeError("Collection is closed")
         return self.__collection.search_by_keywords(
-            index_name, keywords, query, limit, offset, filters, output_fields
+            index_name, keywords, query, limit, offset, filters, output_fields, **kwargs
         )
 
     def search_by_id(
