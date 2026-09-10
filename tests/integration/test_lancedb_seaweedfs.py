@@ -131,8 +131,18 @@ class _SeaweedFsEnv:
         with open(path, "w") as f:
             json.dump(config_data, f)
         OpenVikingConfigSingleton.initialize(config_path=path)
+        self.config_path = path
 
-    def new_adapter(self):
+    def new_adapter(self, lancedb_extra: dict | None = None):
+        if lancedb_extra:
+            # Rewrite the config with additional lancedb options before
+            # building the adapter (used by the ANN visibility test).
+            merged = json.load(open(self.config_path))
+            merged["storage"]["vectordb"]["lancedb"].update(lancedb_extra)
+            with open(self.config_path, "w") as f:
+                json.dump(merged, f)
+            OpenVikingConfigSingleton.reset_instance()
+            OpenVikingConfigSingleton.initialize(config_path=self.config_path)
         adapter = create_collection_adapter(get_openviking_config().storage.vectordb)
         schema = CollectionSchemas.context_collection(self.table_name, DIM)
         adapter.create_collection(
