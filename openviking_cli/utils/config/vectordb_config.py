@@ -385,11 +385,6 @@ class LanceDBConfig(BaseModel):
                 "(e.g. ['<bucket>', 'openviking']); the first segment is the "
                 "Lance table bucket"
             )
-        if not self.namespace_uri and not self.uri:
-            raise ValueError(
-                "LanceDB requires either 'uri' (local path or s3:// prefix) "
-                "or 'namespace_uri' + 'namespace_path' (Lance catalog)"
-            )
         return self
 
     @model_validator(mode="after")
