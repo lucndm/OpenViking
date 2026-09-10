@@ -467,3 +467,37 @@ class TestLanceDBReadConsistencyInterval(unittest.TestCase):
         )
         ids = [item.id for item in result.data]
         assert "rc-1" in ids, "search returned no rows with read_consistency_interval set"
+
+
+class TestTableExistsErrorPropagation(unittest.TestCase):
+    """Regression: a broken backend must raise, not read as "table absent".
+
+    table_exists used to swallow every exception and return False, so a
+    connection- or client-level failure (e.g. a bad read_consistency_interval
+    blowing up inside lancedb) silently degraded searches to empty results.
+    """
+
+    def test_connection_error_propagates_when_fallback_also_fails(self):
+        from openviking.storage.vectordb.collection.lancedb_collection import table_exists
+
+        class BrokenDB:
+            def table_names(self, namespace_path=None):
+                raise RuntimeError("connect failed")
+
+            def table_exists(self, path):
+                raise RuntimeError("connect failed")
+
+        with pytest.raises(RuntimeError, match="connect failed"):
+            table_exists(BrokenDB(), "context")
+
+    def test_fallback_still_works_when_listing_unsupported(self):
+        from openviking.storage.vectordb.collection.lancedb_collection import table_exists
+
+        class ListingUnsupportedDB:
+            def table_names(self, namespace_path=None):
+                raise ValueError("listing unsupported")
+
+            def table_exists(self, path):
+                return True
+
+        assert table_exists(ListingUnsupportedDB(), "context") is True

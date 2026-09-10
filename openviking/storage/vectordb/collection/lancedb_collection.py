@@ -1281,17 +1281,21 @@ def table_exists(db: Any, table_name: str, namespace_path: Optional[List[str]] =
     Prefers listing table names (works for plain URI connections and
     namespace catalogs alike); falls back to the namespace-aware
     ``DB.table_exists`` with the fully qualified path.
+
+    A connection- or client-level failure must propagate: swallowing it
+    here made callers treat a broken backend as "table absent", which
+    silently degraded every downstream search to empty results.
     """
     try:
         names = (
             db.table_names(namespace_path=namespace_path) if namespace_path else db.table_names()
         )
         return table_name in (names or [])
-    except Exception:
+    except Exception as listing_err:
         try:
             return bool(db.table_exists([*(namespace_path or []), table_name]))
         except Exception:
-            return False
+            raise listing_err
 
 
 def create_lancedb_collection(
