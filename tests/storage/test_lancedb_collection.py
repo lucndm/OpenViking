@@ -401,3 +401,69 @@ class TestLanceDBCollectionIntegration(unittest.TestCase):
         newest = self.adapter.query(order_by="level", order_desc=True, limit=2)
         assert [r["id"] for r in newest] == ["new", "mid"]
         assert self.adapter.count(filter=Eq("account_id", "acct-a")) == 3
+
+
+class TestLanceDBReadConsistencyInterval(unittest.TestCase):
+    """Regression: read_consistency_interval_ms must not silently break search.
+
+    lancedb.connect expects a timedelta; passing a float (ms/1000) failed deep
+    inside the client with "'float' object has no attribute 'total_seconds'",
+    which left the collection degraded so every search returned empty results
+    instead of raising.
+    """
+
+    def setUp(self):
+        pytest.importorskip("lancedb")
+        self.test_dir = tempfile.mkdtemp()
+        self.lance_uri = os.path.join(self.test_dir, "lance")
+        config_data = {
+            "storage": {
+                "vectordb": {
+                    "backend": "lancedb",
+                    "name": "context",
+                    "lancedb": {
+                        "uri": self.lance_uri,
+                        "read_consistency_interval_ms": 30000,
+                    },
+                }
+            },
+            "embedding": {
+                "dense": {
+                    "provider": "openai",
+                    "model": "text-embedding-3-small",
+                    "api_key": "mock-key",
+                    "dimension": DIM,
+                }
+            },
+        }
+        self.config_path = os.path.join(self.test_dir, "ov.conf")
+        with open(self.config_path, "w") as f:
+            json.dump(config_data, f)
+        OpenVikingConfigSingleton.initialize(config_path=self.config_path)
+        self.adapter = create_collection_adapter(get_openviking_config().storage.vectordb)
+        self.schema = CollectionSchemas.context_collection("context", DIM)
+
+    def tearDown(self):
+        self.adapter.close()
+        OpenVikingConfigSingleton.reset_instance()
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def test_search_returns_results_with_read_consistency_set(self):
+        self.adapter.create_collection(
+            "context",
+            self.schema,
+            distance="cosine",
+            sparse_weight=0.0,
+            index_name="default",
+        )
+        self.adapter.upsert(
+            [_record("rc-1", "acct-a", "/resources/rc1.md", [0.9] + [0.0] * (DIM - 1))]
+        )
+        coll = self.adapter.get_collection()
+        result = coll.search_by_vector(
+            "default",
+            dense_vector=[0.9] + [0.0] * (DIM - 1),
+            limit=5,
+        )
+        ids = [item.id for item in result.data]
+        assert "rc-1" in ids, "search returned no rows with read_consistency_interval set"

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import re
+from datetime import timedelta
 from typing import Any, Dict, Optional
 
 from openviking.storage.vectordb.collection.collection import Collection
@@ -140,7 +141,12 @@ class LanceDBCollectionAdapter(CollectionAdapter):
             if self._storage_options:
                 kwargs["storage_options"] = self._storage_options
             if self._read_consistency_interval_ms is not None:
-                kwargs["read_consistency_interval"] = self._read_consistency_interval_ms / 1000.0
+                # lancedb expects a timedelta; a bare float fails deep in the
+                # client with "'float' object has no attribute 'total_seconds'"
+                # and the collection silently degrades to empty searches.
+                kwargs["read_consistency_interval"] = timedelta(
+                    milliseconds=self._read_consistency_interval_ms
+                )
             if self._namespace_uri:
                 # Lance Namespace REST catalog (e.g. SeaweedFS Lake):
                 # tables are declared through the catalog while data is
