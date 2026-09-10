@@ -51,7 +51,7 @@ class LanceDBCollectionAdapter(CollectionAdapter):
     def __init__(
         self,
         *,
-        uri: str,
+        uri: Optional[str],
         table_name: str,
         index_name: str,
         storage_options: Optional[Dict[str, str]] = None,
@@ -62,6 +62,8 @@ class LanceDBCollectionAdapter(CollectionAdapter):
         fts: Optional[Dict[str, Any]] = None,
         hybrid: Optional[Dict[str, Any]] = None,
         store_content: bool = False,
+        namespace_uri: Optional[str] = None,
+        namespace_path: Optional[list[str]] = None,
     ):
         super().__init__(collection_name=table_name, index_name=index_name)
         if not LANCEDB_AVAILABLE:
@@ -74,6 +76,8 @@ class LanceDBCollectionAdapter(CollectionAdapter):
         # and the grep engine capability check.
         self.USE_CONTENT_FIELD = store_content
         self._uri = uri
+        self._namespace_uri = namespace_uri
+        self._namespace_path = list(namespace_path or [])
         self._storage_options = dict(storage_options or {})
         self._read_consistency_interval_ms = read_consistency_interval_ms
         self._vector_index = vector_index
@@ -90,10 +94,15 @@ class LanceDBCollectionAdapter(CollectionAdapter):
     @classmethod
     def from_config(cls, config: Any) -> "LanceDBCollectionAdapter":
         cfg = getattr(config, "lancedb", None)
-        if cfg is None or not getattr(cfg, "uri", None):
+        if cfg is None or not (getattr(cfg, "uri", None) or getattr(cfg, "namespace_uri", None)):
             raise ValueError(
-                "LanceDB backend requires 'storage.vectordb.lancedb.uri' to be set "
-                "(local path or s3:// object-store prefix)"
+                "LanceDB backend requires 'storage.vectordb.lancedb.uri' "
+                "(or 'namespace_uri' + 'namespace_path') to be set"
+            )
+        if getattr(cfg, "namespace_uri", None) and not getattr(cfg, "namespace_path", None):
+            raise ValueError(
+                "LanceDB 'namespace_uri' requires 'namespace_path' "
+                "(the first segment is the Lance table bucket)"
             )
         sparse_weight = float(getattr(config, "sparse_weight", 0.0) or 0.0)
         if sparse_weight > 0.0:
@@ -117,6 +126,8 @@ class LanceDBCollectionAdapter(CollectionAdapter):
             fts=fts_cfg.model_dump() if fts_cfg else None,
             hybrid=hybrid_cfg.model_dump() if hybrid_cfg else None,
             store_content=bool(getattr(cfg, "store_content", False)),
+            namespace_uri=getattr(cfg, "namespace_uri", None),
+            namespace_path=getattr(cfg, "namespace_path", None) or [],
         )
 
     # -- backend connection ---------------------------------------------------
@@ -130,7 +141,18 @@ class LanceDBCollectionAdapter(CollectionAdapter):
                 kwargs["storage_options"] = self._storage_options
             if self._read_consistency_interval_ms is not None:
                 kwargs["read_consistency_interval"] = self._read_consistency_interval_ms / 1000.0
-            self._db = lancedb.connect(self._uri, **kwargs)
+            if self._namespace_uri:
+                # Lance Namespace REST catalog (e.g. SeaweedFS Lake):
+                # tables are declared through the catalog while data is
+                # written straight to the object store.
+                kwargs.pop("read_consistency_interval", None)
+                self._db = lancedb.connect_namespace(
+                    "rest",
+                    {"uri": self._namespace_uri},
+                    **kwargs,
+                )
+            else:
+                self._db = lancedb.connect(self._uri, **kwargs)
         return self._db
 
     def _schema_meta(self) -> Dict[str, Any]:
@@ -147,7 +169,7 @@ class LanceDBCollectionAdapter(CollectionAdapter):
         db = self._connect_db()
         from openviking.storage.vectordb.collection.lancedb_collection import table_exists
 
-        if not table_exists(db, self._collection_name):
+        if not table_exists(db, self._collection_name, self._namespace_path):
             return None
         from openviking_cli.utils.config import get_openviking_config
 
@@ -164,6 +186,7 @@ class LanceDBCollectionAdapter(CollectionAdapter):
             fts=self._fts,
             hybrid=self._hybrid,
             store_content=self._store_content,
+            namespace_path=self._namespace_path,
         )
         return Collection(collection)
 
@@ -191,6 +214,7 @@ class LanceDBCollectionAdapter(CollectionAdapter):
             fts=self._fts,
             hybrid=self._hybrid,
             store_content=self._store_content,
+            namespace_path=self._namespace_path,
         )
         if not created:
             logger = self._get_logger()

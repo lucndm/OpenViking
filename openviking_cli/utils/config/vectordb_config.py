@@ -293,6 +293,22 @@ class LanceDBConfig(BaseModel):
             "(e.g. 's3://openviking/lancedb')"
         ),
     )
+    namespace_uri: Optional[str] = Field(
+        default=None,
+        description=(
+            "Lance Namespace REST endpoint (e.g. 'http://seaweedfs:9101'). "
+            "When set, tables are managed through the namespace catalog "
+            "instead of the plain URI."
+        ),
+    )
+    namespace_path: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Namespace path segments below the catalog root. For SeaweedFS "
+            "the first element is the Lance table bucket, e.g. "
+            "['vectors', 'openviking']."
+        ),
+    )
     storage_options: Dict[str, str] = Field(
         default_factory=dict,
         description=(
@@ -359,6 +375,21 @@ class LanceDBConfig(BaseModel):
                     f"LanceDB scalar index type {index_type!r} for field {field!r} "
                     f"must be one of {sorted(allowed)}"
                 )
+        return self
+
+    @model_validator(mode="after")
+    def validate_connection_mode(self):
+        if self.namespace_uri and not self.namespace_path:
+            raise ValueError(
+                "LanceDB namespace_uri requires namespace_path "
+                "(e.g. ['<bucket>', 'openviking']); the first segment is the "
+                "Lance table bucket"
+            )
+        if not self.namespace_uri and not self.uri:
+            raise ValueError(
+                "LanceDB requires either 'uri' (local path or s3:// prefix) "
+                "or 'namespace_uri' + 'namespace_path' (Lance catalog)"
+            )
         return self
 
     @model_validator(mode="after")
@@ -526,8 +557,11 @@ class VectorDBBackendConfig(BaseModel):
                 raise ValueError("VectorDB vikingdb backend requires 'host' to be set")
 
         elif self.backend == "lancedb":
-            if not self.lancedb or not self.lancedb.uri:
-                raise ValueError("VectorDB lancedb backend requires 'lancedb.uri' to be set")
+            if not self.lancedb or not (self.lancedb.uri or self.lancedb.namespace_uri):
+                raise ValueError(
+                    "VectorDB lancedb backend requires 'lancedb.uri' "
+                    "(or 'lancedb.namespace_uri' + 'namespace_path') to be set"
+                )
             if self.sparse_weight > 0.0:
                 raise ValueError(
                     "VectorDB lancedb backend is dense-only; 'sparse_weight' must be 0"

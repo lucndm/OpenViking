@@ -357,6 +357,7 @@ class LanceDBCollection(ICollection):
         fts: Optional[Dict[str, Any]] = None,
         hybrid: Optional[Dict[str, Any]] = None,
         store_content: bool = False,
+        namespace_path: Optional[List[str]] = None,
     ):
         super().__init__()
         if not LANCEDB_AVAILABLE:  # pragma: no cover - defensive
@@ -381,6 +382,7 @@ class LanceDBCollection(ICollection):
         self._fts_cfg: Optional[Dict[str, Any]] = dict(fts) if fts else None
         self._hybrid_cfg: Optional[Dict[str, Any]] = dict(hybrid) if hybrid else None
         self._store_content = store_content
+        self._namespace_path: List[str] = list(namespace_path or [])
         self._bulk_ingest_depth = 0
         self._maintenance_runs = 0
         self._table: Any = None
@@ -396,15 +398,21 @@ class LanceDBCollection(ICollection):
             return {}
         return {key.decode("utf-8"): value.decode("utf-8") for key, value in stored.items()}
 
+    def _table_open_kwargs(self) -> Dict[str, Any]:
+        if self._namespace_path:
+            return {"namespace_path": self._namespace_path}
+        return {}
+
     def _load_or_create_table(self, create: bool, arrow_schema: Any = None) -> None:
-        if table_exists(self._db, self._table_name):
-            self._table = self._db.open_table(self._table_name)
+        kwargs = self._table_open_kwargs()
+        if table_exists(self._db, self._table_name, self._namespace_path):
+            self._table = self._db.open_table(self._table_name, **kwargs)
             self._restore_metadata()
             self._validate_dimension()
         elif create:
             if arrow_schema is None:
                 raise ValueError("Creating a LanceDB table requires a schema")
-            self._table = self._db.create_table(self._table_name, schema=arrow_schema)
+            self._table = self._db.create_table(self._table_name, schema=arrow_schema, **kwargs)
             self._persist_metadata()
         else:
             self._table = None
@@ -566,7 +574,7 @@ class LanceDBCollection(ICollection):
         self._table = None
 
     def drop(self):
-        self._db.drop_table(self._table_name)
+        self._db.drop_table(self._table_name, **self._table_open_kwargs())
         self._table = None
 
     # -- ICollection: index lifecycle ----------------------------------------
@@ -1267,18 +1275,21 @@ class LanceDBCollection(ICollection):
 # ---------------------------------------------------------------------------
 
 
-def table_exists(db: Any, table_name: str) -> bool:
+def table_exists(db: Any, table_name: str, namespace_path: Optional[List[str]] = None) -> bool:
     """Return whether *table_name* exists in *db*.
 
-    ``DB.table_exists`` only supports namespace connections, so plain URI
-    connections (local directories, object stores) fall back to listing table
-    names.
+    Prefers listing table names (works for plain URI connections and
+    namespace catalogs alike); falls back to the namespace-aware
+    ``DB.table_exists`` with the fully qualified path.
     """
     try:
-        return table_name in (db.table_names() or [])
+        names = (
+            db.table_names(namespace_path=namespace_path) if namespace_path else db.table_names()
+        )
+        return table_name in (names or [])
     except Exception:
         try:
-            return bool(db.table_exists([table_name]))
+            return bool(db.table_exists([*(namespace_path or []), table_name]))
         except Exception:
             return False
 
@@ -1296,6 +1307,7 @@ def create_lancedb_collection(
     fts: Optional[Dict[str, Any]] = None,
     hybrid: Optional[Dict[str, Any]] = None,
     store_content: bool = False,
+    namespace_path: Optional[List[str]] = None,
 ) -> Tuple[LanceDBCollection, bool]:
     """Open or create a LanceDB-backed collection.
 
@@ -1305,7 +1317,7 @@ def create_lancedb_collection(
     shadow table.
     """
     field_types = field_types_from_meta(meta_data)
-    existed = table_exists(db, table_name)
+    existed = table_exists(db, table_name, namespace_path)
     arrow_schema = None
     if not existed:
         arrow_schema = build_arrow_schema(meta_data)
@@ -1321,6 +1333,7 @@ def create_lancedb_collection(
         fts=fts,
         hybrid=hybrid,
         store_content=store_content,
+        namespace_path=namespace_path,
     )
     if existed:
         return collection, False
