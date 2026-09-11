@@ -22,9 +22,11 @@ jobs:
           fetch-depth: 0
           submodules: recursive
 
-      - name: Compute image tag
+      - name: Compute image tag and version
         id: tag
-        run: echo "tag=feat-lancedb-$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+        run: |
+          echo "tag=feat-lancedb-$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "version=0.0.0.dev$(git rev-list --count HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Log in to the Container registry
         uses: docker/login-action@v4
@@ -54,6 +56,6 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
-            OPENVIKING_VERSION=${{ steps.tag.outputs.tag }}
+            OPENVIKING_VERSION=${{ steps.tag.outputs.version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
