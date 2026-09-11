@@ -1,9 +1,14 @@
-name: Build Fork Image (feature branch)
+name: Build Fork Image (deploy)
 
 on:
   workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to build (defaults to the branch dispatched from)"
+        required: false
+        type: string
   push:
-    branches: [feat/lancedb-vectordb-backend]
+    branches: [deploy]
 
 env:
   REGISTRY: ghcr.io
@@ -21,11 +26,12 @@ jobs:
         with:
           fetch-depth: 0
           submodules: recursive
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Compute image tag and version
         id: tag
         run: |
-          echo "tag=feat-lancedb-$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "tag=deploy-$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
           echo "version=0.0.0.dev$(git rev-list --count HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Log in to the Container registry
@@ -41,7 +47,7 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ github.repository }}
           tags: |
-            type=raw,value=feat-lancedb
+            type=raw,value=deploy
             type=raw,value=${{ steps.tag.outputs.tag }}
 
       - name: Set up Docker Buildx
