@@ -188,6 +188,225 @@ class CuVSConfig(BaseModel):
         return self
 
 
+class LanceVectorIndexConfig(BaseModel):
+    """Native Lance vector (ANN) index configuration."""
+
+    index_type: Literal[
+        "IVF_PQ",
+        "IVF_FLAT",
+        "IVF_SQ",
+        "IVF_HNSW_PQ",
+        "IVF_HNSW_SQ",
+        "IVF_HNSW_FLAT",
+    ] = Field(
+        default="IVF_PQ",
+        description="Lance ANN index type; IVF_PQ is the production default.",
+    )
+    num_partitions: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description="IVF partition count; None lets Lance derive it from table size.",
+    )
+    num_sub_vectors: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description="PQ sub-vector count; None lets Lance derive it from dimension.",
+    )
+    num_bits: int = Field(default=8, ge=1, le=16, description="PQ quantization bits.")
+    min_rows_to_build: int = Field(
+        default=256,
+        ge=0,
+        description=(
+            "Defer ANN training until the table has at least this many rows. "
+            "Search remains correct meanwhile: unindexed fragments are scanned "
+            "flat."
+        ),
+    )
+
+    model_config = {"extra": "forbid"}
+
+
+class LanceFTSConfig(BaseModel):
+    """Full-text search configuration for the LanceDB backend."""
+
+    columns: list[str] = Field(
+        default_factory=lambda: ["content"],
+        description="Columns to index for full-text search.",
+    )
+    language: str = Field(
+        default="English",
+        description="Stemming language for the tokenizer (e.g. 'English', 'Chinese').",
+    )
+    with_position: bool = Field(
+        default=False,
+        description="Store token positions; required for phrase queries.",
+    )
+    stem: bool = Field(default=True, description="Enable stemming.")
+    remove_stop_words: bool = Field(default=True, description="Drop stop words.")
+    ascii_folding: bool = Field(
+        default=True,
+        description="Fold accented characters to ASCII so diacritic-insensitive matches work.",
+    )
+    custom_stop_words: Optional[list[str]] = Field(
+        default=None, description="Extra stop words beyond the language defaults."
+    )
+
+    model_config = {"extra": "forbid"}
+
+
+class LanceHybridConfig(BaseModel):
+    """Dense + lexical fusion configuration for the LanceDB backend.
+
+    These are neutral controls: the generic ``sparse_weight`` setting is not
+    reused for LanceDB lexical weighting.
+    """
+
+    method: Literal["rrf", "weighted"] = Field(
+        default="rrf",
+        description="Fusion method: reciprocal rank fusion or weighted scores.",
+    )
+    dense_weight: float = Field(
+        default=0.7, ge=0.0, le=1.0, description="Weight of the dense branch."
+    )
+    lexical_weight: float = Field(
+        default=0.3, ge=0.0, le=1.0, description="Weight of the lexical branch."
+    )
+    rrf_k: int = Field(default=60, ge=1, description="RRF smoothing constant.")
+
+    model_config = {"extra": "forbid"}
+
+
+class LanceDBConfig(BaseModel):
+    """Configuration for the LanceDB backend.
+
+    ``uri`` addresses the LanceDB database: a local directory path (for
+    development) or an object-store prefix such as ``s3://bucket/parent``
+    (durable deployments, e.g. SeaweedFS S3).  Storage credentials are passed
+    via ``storage_options``; values of the form ``${ENV_VAR}`` are expanded
+    from the environment so permanent keys never live in config files.
+    """
+
+    uri: Optional[str] = Field(
+        default=None,
+        description=(
+            "LanceDB database URI: local path or object-store prefix "
+            "(e.g. 's3://openviking/lancedb')"
+        ),
+    )
+    namespace_uri: Optional[str] = Field(
+        default=None,
+        description=(
+            "Lance Namespace REST endpoint (e.g. 'http://seaweedfs:9101'). "
+            "When set, tables are managed through the namespace catalog "
+            "instead of the plain URI."
+        ),
+    )
+    namespace_path: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Namespace path segments below the catalog root. For SeaweedFS "
+            "the first element is the Lance table bucket, e.g. "
+            "['vectors', 'openviking']."
+        ),
+    )
+    storage_options: Dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Storage options passed to LanceDB (e.g. aws_endpoint, aws_region, "
+            "allow_http). '${ENV_VAR}' values are expanded from the environment."
+        ),
+    )
+    read_consistency_interval_ms: Optional[float] = Field(
+        default=None,
+        ge=0,
+        description=(
+            "Interval for automatic table refresh, in milliseconds. None keeps the LanceDB default."
+        ),
+    )
+    vector_index: Optional[LanceVectorIndexConfig] = Field(
+        default=None,
+        description=(
+            "Native Lance ANN vector index; None keeps flat (unindexed) dense "
+            "search, which stays correct at any table size."
+        ),
+    )
+    scalar_indexes: Dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Native Lance scalar indexes per field, e.g. "
+            "{'account_id': 'BTREE', 'search_tags': 'LABEL_LIST'}. "
+            "Supported types: BTREE, BITMAP, LABEL_LIST."
+        ),
+    )
+    optimize_after_bulk_ingest: bool = Field(
+        default=True,
+        description=(
+            "Run one coalesced maintenance pass (compaction + index "
+            "optimization) when a bulk-ingest scope ends, instead of per batch."
+        ),
+    )
+    store_content: bool = Field(
+        default=False,
+        description=(
+            "Persist the full 'content' field so LanceDB full-text search and "
+            "grep integration can be enabled. AGFS remains the canonical "
+            "content source."
+        ),
+    )
+    fts: Optional[LanceFTSConfig] = Field(
+        default=None,
+        description="Opt-in full-text (BM25) index over persisted text columns.",
+    )
+    hybrid: Optional[LanceHybridConfig] = Field(
+        default=None,
+        description=(
+            "Opt-in dense + lexical fusion used when a keyword query also carries a query vector."
+        ),
+    )
+
+    model_config = {"extra": "forbid"}
+
+    @model_validator(mode="after")
+    def validate_scalar_indexes(self):
+        allowed = {"BTREE", "BITMAP", "LABEL_LIST"}
+        for field, index_type in self.scalar_indexes.items():
+            if index_type not in allowed:
+                raise ValueError(
+                    f"LanceDB scalar index type {index_type!r} for field {field!r} "
+                    f"must be one of {sorted(allowed)}"
+                )
+        return self
+
+    @model_validator(mode="after")
+    def validate_connection_mode(self):
+        if self.namespace_uri and not self.namespace_path:
+            raise ValueError(
+                "LanceDB namespace_uri requires namespace_path "
+                "(e.g. ['<bucket>', 'openviking']); the first segment is the "
+                "Lance table bucket"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_search_features(self):
+        if self.fts is not None and not self.store_content:
+            if "content" in self.fts.columns:
+                raise ValueError(
+                    "LanceDB full-text search over 'content' requires "
+                    "'store_content: true'; refusing to index a field that is "
+                    "never persisted"
+                )
+        if self.hybrid is not None and self.fts is None:
+            raise ValueError(
+                "LanceDB hybrid search requires 'fts' to be configured for the lexical branch"
+            )
+        if self.hybrid is not None:
+            total = self.hybrid.dense_weight + self.hybrid.lexical_weight
+            if total <= 0:
+                raise ValueError("LanceDB hybrid weights must sum to a positive value")
+        return self
+
+
 class VectorDBBackendConfig(BaseModel):
     """
     Configuration for VectorDB backend.
@@ -201,7 +420,8 @@ class VectorDBBackendConfig(BaseModel):
         description=(
             "VectorDB backend type: 'local', 'cuvs', 'http', "
             "'volcengine' (AK/SK signed or API key data-plane only), "
-            "or 'vikingdb' (private deployment)"
+            "'vikingdb' (private deployment), or 'lancedb' (Lance format, "
+            "local or object storage)"
         ),
     )
 
@@ -260,6 +480,11 @@ class VectorDBBackendConfig(BaseModel):
         description="NVIDIA cuVS dense-vector search configuration for the 'cuvs' backend",
     )
 
+    lancedb: Optional[LanceDBConfig] = Field(
+        default_factory=LanceDBConfig,
+        description="LanceDB configuration for the 'lancedb' backend",
+    )
+
     custom_params: Dict[str, Any] = Field(
         default_factory=dict,
         description="Custom parameters for custom backend adapters",
@@ -276,6 +501,7 @@ class VectorDBBackendConfig(BaseModel):
             "http",
             "volcengine",
             "vikingdb",
+            "lancedb",
         ]
 
         # Allow custom backend classes (containing dot) without standard validation
@@ -324,5 +550,20 @@ class VectorDBBackendConfig(BaseModel):
         elif self.backend == "vikingdb":
             if not self.vikingdb or not self.vikingdb.host:
                 raise ValueError("VectorDB vikingdb backend requires 'host' to be set")
+
+        elif self.backend == "lancedb":
+            if not self.lancedb or not (self.lancedb.uri or self.lancedb.namespace_uri):
+                raise ValueError(
+                    "VectorDB lancedb backend requires 'lancedb.uri' "
+                    "(or 'lancedb.namespace_uri' + 'namespace_path') to be set"
+                )
+            if self.sparse_weight > 0.0:
+                raise ValueError(
+                    "VectorDB lancedb backend is dense-only; 'sparse_weight' must be 0"
+                )
+            if self.distance_metric not in ("cosine", "l2", "ip"):
+                raise ValueError(
+                    "VectorDB lancedb backend supports distance_metric 'cosine', 'l2', or 'ip'"
+                )
 
         return self
